@@ -1,0 +1,26 @@
+{
+  "skill_name": "upstream-sync",
+  "evals": [
+    {
+      "id": 0,
+      "name": "first-run-bootstrap",
+      "prompt": "A setup script has been run that created a sandbox fixture at $FIXTURE_DIR. $FIXTURE_DIR/fork is a git clone of a fork with no `.upstream-version` file. $FIXTURE_DIR/upstream is a local git repo acting as the upstream (use its path as the upstream URL). Run the upstream-sync workflow from inside $FIXTURE_DIR/fork with the upstream URL as the argument. The environment variable UPSTREAM_SYNC_DRY_RUN=1 is set, so do everything except the actual push and MR creation — print the MR body to stdout instead. Save everything you print to $OUTPUT_DIR/stdout.txt. When finished, also copy $FIXTURE_DIR/fork/.upstream-version (if it exists) and the output of `git -C $FIXTURE_DIR/fork log --oneline --all` to $OUTPUT_DIR/.",
+      "expected_output": "On a first run with no `.upstream-version`, the skill should (a) create `.upstream-version` containing `v1.1.0`, (b) commit the tracking file on a sync branch, (c) NOT merge upstream's v1.1.0 history retroactively, (d) print an MR body describing this as a bootstrap.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "clean-upgrade-no-conflict",
+      "prompt": "A setup script has been run that created a sandbox fixture at $FIXTURE_DIR. $FIXTURE_DIR/fork is a git clone of a fork tracking upstream tag v1.0.0 (recorded in `.upstream-version`). Upstream has released v1.1.0 with non-conflicting changes. Run the upstream-sync workflow from inside $FIXTURE_DIR/fork with $FIXTURE_DIR/upstream as the upstream URL argument. UPSTREAM_SYNC_DRY_RUN=1 is set — print the MR body to stdout instead of pushing or creating an MR. Save everything you print to $OUTPUT_DIR/stdout.txt. Also copy $FIXTURE_DIR/fork/.upstream-version, $FIXTURE_DIR/fork/docs/tutorial.md (if merged), $FIXTURE_DIR/fork/src/core.py, $FIXTURE_DIR/fork/src/fork_feature.py, and the output of `git -C $FIXTURE_DIR/fork log --oneline --all` to $OUTPUT_DIR/.",
+      "expected_output": "Skill creates a sync branch, merges v1.1.0 cleanly (no conflicts), updates `.upstream-version` to v1.1.0, preserves fork's FORK.md and fork_feature.py, gains upstream's new docs/tutorial.md and the farewell() function. MR body says 'Clean merge, no conflicts.'",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "conflict-upgrade-intelligent-resolution",
+      "prompt": "A setup script has been run that created a sandbox fixture at $FIXTURE_DIR. $FIXTURE_DIR/fork is a git clone of a fork tracking upstream tag v1.0.0. Upstream has released v1.1.0 which edits `config.json` — specifically changing the `url` field and adding a `retries` field. The fork has independently added a `fork_feature: true` field to the same region of `config.json`. Merging will conflict. Run the upstream-sync workflow from inside $FIXTURE_DIR/fork with $FIXTURE_DIR/upstream as the upstream URL argument. UPSTREAM_SYNC_DRY_RUN=1 is set — print the MR body to stdout instead of pushing. Save everything you print to $OUTPUT_DIR/stdout.txt. Also copy $FIXTURE_DIR/fork/config.json (the final resolved version), $FIXTURE_DIR/fork/.upstream-version, and the output of `git -C $FIXTURE_DIR/fork log --oneline --all` to $OUTPUT_DIR/.",
+      "expected_output": "Skill merges v1.1.0, resolves the conflict in config.json by preserving upstream's url change + retries addition AND the fork's fork_feature field. Resulting JSON is valid and contains all four fields (timeout, url=http://new.example.com, retries=3, fork_feature=true). `.upstream-version` updated to v1.1.0. MR body lists config.json as a resolved conflict and explains the resolution.",
+      "files": []
+    }
+  ]
+}
