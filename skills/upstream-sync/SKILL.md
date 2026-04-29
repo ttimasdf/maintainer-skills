@@ -5,7 +5,7 @@ description: Sync a GitLab fork with the latest tagged release from an upstream 
 
 # Upstream Sync
 
-Keep a long-lived GitLab fork in sync with tagged releases from an upstream repository. Runs unattended in CI (`claude -p "/upstream-sync [UPSTREAM_URL]"`) or interactively.
+Keep a long-lived GitLab fork in sync with tagged releases from an upstream repository. Runs unattended in CI (`opencode -p "/upstream-sync [UPSTREAM_URL]"`) or interactively.
 
 ## What this skill does
 
@@ -21,7 +21,7 @@ Using an upstream repo URL (from the skill argument, or inferred from the git re
 
 - **Argument 1 (optional)**: upstream repo URL (HTTPS or SSH). Resolution order:
   - If the arg is present, use it. If a remote named `upstream` already exists with a different URL, update it with `git remote set-url`; if no such remote exists, add it.
-  - If the arg is absent, read the URL from the existing `upstream` remote (`git remote get-url upstream`). This is the common CI case for forks that already have the remote configured — `claude -p /upstream-sync` with no args just works.
+  - If the arg is absent, read the URL from the existing `upstream` remote (`git remote get-url upstream`). This is the common CI case for forks that already have the remote configured — `opencode -p /upstream-sync` with no args just works.
   - If the arg is absent and no `upstream` remote exists, abort with a clear error message: "no upstream URL provided and no 'upstream' git remote configured".
 - **Current working directory**: a checked-out clone of the fork. `HEAD` is on the development branch that MRs should target.
 - **Tracking file**: `.upstream-version` at the repo root. It uses shell-style key/value lines:
@@ -409,7 +409,7 @@ If `UPSTREAM_SYNC_DRY_RUN=1` is set in the environment, do everything through st
 **Explicit URL arg (typical CI use):**
 
 ```
-$ claude -p "/upstream-sync https://github.com/upstream-org/project.git"
+$ opencode -p "/upstream-sync https://github.com/upstream-org/project.git"
 
 Detected dev branch: main
 Using upstream URL from argument; updating existing 'upstream' remote.
@@ -433,7 +433,7 @@ Cleaned up worktree .git-upstream-sync-worktree
 **No arg, reuses existing remote:**
 
 ```
-$ claude -p "/upstream-sync"
+$ opencode -p "/upstream-sync"
 
 Detected dev branch: main
 Using upstream URL from existing 'upstream' remote: https://github.com/upstream-org/project.git
