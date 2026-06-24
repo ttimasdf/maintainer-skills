@@ -56,31 +56,71 @@ If `UPSTREAM_URL` is empty, abort with: "No upstream URL provided. Usage: /init-
 
 ### 3. Discover the baseline upstream tag
 
-The fork was created from upstream at some point. Find which upstream tag the fork's history contains, so `.upstream-version` starts with an accurate baseline rather than blindly recording "latest." This mirrors the bootstrap logic in `/upstream-sync`:
+The fork was created from upstream at some point. Find the upstream tag that best represents the fork's actual starting point, so `.upstream-version` starts with an accurate baseline rather than blindly recording "latest."
+
+Prefer the **nearest version-like ancestor tag** to `HEAD`, not the numerically largest reachable tag. Some upstream maintainers use irregular tag numbering, backport tags, calendar versions, or branch-specific release tags; in those repos, sorting tags by refname/version and picking the biggest number can choose a tag that is reachable but not the closest historical baseline for this fork.
+
+Use the highest version-like tag only as a comparison point and fallback:
 
 ```bash
+TAG_PATTERNS=("refs/tags/v[0-9]*" "refs/tags/[0-9]*")
+DESCRIBE_MATCHES=(--match "v[0-9]*" --match "[0-9]*")
+
 LATEST_TAG=$(git -c versionsort.suffix=-pre \
   for-each-ref --sort=-v:refname --format='%(refname:short)' \
-  'refs/tags/v[0-9]*' 'refs/tags/[0-9]*' \
+  "${TAG_PATTERNS[@]}" \
   --count=1)
 
-BASELINE_TAG=""
+NEAREST_ANCESTOR_TAG=$(git describe --tags --abbrev=0 \
+  "${DESCRIBE_MATCHES[@]}" HEAD 2>/dev/null || true)
+
+HIGHEST_ANCESTOR_TAG=""
 while read -r tag; do
     [[ -z "$tag" ]] && continue
     if git merge-base --is-ancestor "refs/tags/$tag" HEAD 2>/dev/null; then
-        BASELINE_TAG="$tag"
+        HIGHEST_ANCESTOR_TAG="$tag"
         break
     fi
 done < <(git -c versionsort.suffix=-pre \
     for-each-ref --sort=-v:refname --format='%(refname:short)' \
-    'refs/tags/v[0-9]*' 'refs/tags/[0-9]*')
+    "${TAG_PATTERNS[@]}")
+
+BASELINE_TAG="$NEAREST_ANCESTOR_TAG"
+
+if [[ -n "$NEAREST_ANCESTOR_TAG" && -n "$HIGHEST_ANCESTOR_TAG" && \
+      "$NEAREST_ANCESTOR_TAG" != "$HIGHEST_ANCESTOR_TAG" ]]; then
+    cat <<EOF
+Warning: the nearest ancestor tag differs from the numerically highest ancestor tag.
+
+  Nearest ancestor tag:        $NEAREST_ANCESTOR_TAG
+  Highest version-like tag:    $HIGHEST_ANCESTOR_TAG
+
+This usually means upstream's tag numbers do not line up with the commit graph
+(for example: backports, branch-specific releases, calendar versions, or
+nonlinear maintenance branches). The nearest ancestor tag is usually the safest
+baseline because it reflects where this fork actually sits in history.
+EOF
+
+    echo "Ask the user which baseline to record:"
+    echo "  1) $NEAREST_ANCESTOR_TAG  (nearest ancestor; recommended default)"
+    echo "  2) $HIGHEST_ANCESTOR_TAG  (highest version-like ancestor)"
+    echo "  3) another tag/manual value"
+    echo "Do not continue until the user chooses."
+fi
 
 if [[ -z "$BASELINE_TAG" ]]; then
-    echo "Warning: no upstream tag found in fork ancestry. Using latest tag ($LATEST_TAG) as baseline."
-    echo "If this fork shares history with upstream, the first /upstream-sync run will discover the correct baseline."
-    BASELINE_TAG="$LATEST_TAG"
+    if [[ -n "$LATEST_TAG" ]]; then
+        echo "Warning: no upstream tag found in fork ancestry. Using latest tag ($LATEST_TAG) as baseline."
+        echo "If this fork shares history with upstream, verify the baseline before the first /upstream-sync run."
+        BASELINE_TAG="$LATEST_TAG"
+    else
+        echo "Warning: upstream has no version-like tags. Recording UPSTREAM_VERSION=none."
+        BASELINE_TAG="none"
+    fi
 fi
 ```
+
+If `NEAREST_ANCESTOR_TAG` and `HIGHEST_ANCESTOR_TAG` differ, pause and ask the user to choose before creating `.upstream-version`. Default to the nearest ancestor tag only after the user confirms that default. Record the user's chosen value in `BASELINE_TAG`.
 
 ### 4. Create `.upstream-version`
 
@@ -121,10 +161,15 @@ The fork may already contain commits that don't exist upstream. This step discov
 Using the `BASELINE_TAG` discovered in step 3, list commits on the dev branch that are not reachable from the upstream tag:
 
 ```bash
-FORK_COMMITS=$(git log --format='%H %s' refs/tags/"$BASELINE_TAG"..HEAD --no-merges)
+if [[ -n "$BASELINE_TAG" && "$BASELINE_TAG" != "none" ]] && \
+   git rev-parse -q --verify "refs/tags/$BASELINE_TAG" >/dev/null; then
+    FORK_COMMITS=$(git log --format='%H %s' refs/tags/"$BASELINE_TAG"..HEAD --no-merges)
+else
+    FORK_COMMITS=$(git log --format='%H %s' --no-merges)
+fi
 ```
 
-If `BASELINE_TAG` is empty (no shared history), fall back to listing all commits and note that everything appears fork-only — this is likely a re-initialized repo and the user should cherry-pick carefully.
+If `BASELINE_TAG` is `none` or does not resolve to a local tag (no tags or no shared history), fall back to listing all commits and note that everything appears fork-only — this is likely a re-initialized repo and the user should cherry-pick carefully.
 
 #### Present the commits
 
@@ -305,6 +350,7 @@ Next steps:
 - **AGENTS.md has existing content**: The section is appended at the end. The skill checks for an existing `## Fork Maintenance` heading to avoid duplication.
 - **Repo is not yet pushed to GitLab**: The skill only touches local files and the git remote config. Pushing is the user's responsibility.
 - **`.upstream-version` already exists**: Ask before overwriting — the user may be re-initializing after a partial setup.
+- **Nearest ancestor tag differs from highest numbered ancestor tag**: Warn prominently and ask the user which baseline to record. Recommend the nearest ancestor tag because it reflects the actual commit-graph baseline, but allow the user to choose the highest numbered tag or provide another tag manually.
 - **No upstream tags found**: Still create the infrastructure. `.upstream-version` records `UPSTREAM_VERSION=none` and the first `/upstream-sync` run will handle the bootstrap when tags appear.
 - **Fork has no shared history with upstream** (re-initialized repo): The skill warns prominently but proceeds. The first `/upstream-sync` run will detect this and handle it.
 - **Many fork-only commits**: If there are more than ~30 fork-only commits, warn the user that the list is large and suggest they review carefully. Group related commits aggressively to keep the ledger manageable. The goal is a concise change ledger, not a 1:1 commit mirror.

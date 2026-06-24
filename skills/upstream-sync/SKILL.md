@@ -31,6 +31,7 @@ Using an upstream repo URL (from the skill argument, or inferred from the git re
   ```
   If the file doesn't exist, treat this as a first run — see *First-run bootstrap* below. If it exists in the legacy one-line format, treat the first line as `UPSTREAM_VERSION`, infer `UPSTREAM_REPO` from the argument or `upstream` remote, and rewrite the file in the new format during step 8.
 - **Downstream change ledger**: `DOWNSTREAM_CHANGES.md` at the repo root, when present, documents intentional fork-only behavior. Read it before resolving conflicts and use it as the source of truth for changes that should survive upstream merges.
+- **Optional bootstrap override**: `UPSTREAM_SYNC_BASELINE_TAG=<tag>` may be set on first run to force a specific baseline tag when the nearest ancestor tag and highest numbered ancestor tag differ. Use this for non-interactive CI reruns after a reviewer chooses a baseline.
 - **Auth**: in CI, expect `GITLAB_TOKEN` or `CI_JOB_TOKEN` to be set; locally, expect `glab auth status` to succeed.
 
 Do not modify anything on the current dev branch directly. All work happens inside a **git worktree** on a throwaway `upstream-sync/<tag>` branch. The worktree isolates the sync from the main working tree — the dev branch stays checked out and untouched throughout.
@@ -106,28 +107,105 @@ Filter out pre-release tags (anything containing `-alpha`, `-beta`, `-rc`, `-pre
 
 The fork's history almost certainly already contains some upstream commit (it was forked from upstream at some point). The bootstrap's job is to **discover which upstream tag the fork is currently sitting on**, not to invent a baseline by importing the latest tag.
 
-Iterate upstream's main-product tags from newest to oldest and pick the first one whose commit is reachable from the current dev branch. The result is a `LAST_TAG` variable that the rest of the workflow uses exactly as if `.upstream-version` had contained it on disk all along — no intermediate commit, no separate "bootstrap branch":
+Find the **nearest version-like ancestor tag** to `HEAD`, not merely the numerically highest reachable tag. Some upstream maintainers use irregular tag numbering, backport tags, calendar versions, or branch-specific releases; in those repos, sorting reachable tags by refname/version and picking the biggest number can choose a tag that exists in history but is not the fork's closest baseline.
+
+Use the numerically highest ancestor tag only as a comparison point. The result is a `LAST_TAG` variable that the rest of the workflow uses exactly as if `.upstream-version` had contained it on disk all along — no intermediate commit, no separate "bootstrap branch":
 
 ```bash
-LAST_TAG=""
+TAG_PATTERNS=("refs/tags/v[0-9]*" "refs/tags/[0-9]*")
+DESCRIBE_MATCHES=(--match "v[0-9]*" --match "[0-9]*")
+
+NEAREST_ANCESTOR_TAG=$(git describe --tags --abbrev=0 \
+  "${DESCRIBE_MATCHES[@]}" HEAD 2>/dev/null || true)
+
+HIGHEST_ANCESTOR_TAG=""
 while read -r tag; do
     [[ -z "$tag" ]] && continue
     if git merge-base --is-ancestor "refs/tags/$tag" HEAD 2>/dev/null; then
-        LAST_TAG="$tag"
+        HIGHEST_ANCESTOR_TAG="$tag"
         break
     fi
 done < <(git -c versionsort.suffix=-pre \
     for-each-ref --sort=-v:refname --format='%(refname:short)' \
-    'refs/tags/v[0-9]*' 'refs/tags/[0-9]*')
+    "${TAG_PATTERNS[@]}")
+
+LAST_TAG="$NEAREST_ANCESTOR_TAG"
+BOOTSTRAP_BASELINE_SOURCE="nearest ancestor"
+BOOTSTRAP_BASELINE_WARNING=""
 BOOTSTRAPPED=1   # remember this so the MR description can explain what happened
+
+if [[ -n "${UPSTREAM_SYNC_BASELINE_TAG:-}" ]]; then
+    LAST_TAG="$UPSTREAM_SYNC_BASELINE_TAG"
+    BOOTSTRAP_BASELINE_SOURCE="UPSTREAM_SYNC_BASELINE_TAG override"
+elif [[ -n "$NEAREST_ANCESTOR_TAG" && -n "$HIGHEST_ANCESTOR_TAG" && \
+        "$NEAREST_ANCESTOR_TAG" != "$HIGHEST_ANCESTOR_TAG" ]]; then
+    BOOTSTRAP_BASELINE_WARNING="nearest ancestor tag ($NEAREST_ANCESTOR_TAG) differs from highest version-like ancestor tag ($HIGHEST_ANCESTOR_TAG)"
+    cat <<EOF
+Warning: $BOOTSTRAP_BASELINE_WARNING.
+
+This usually means upstream's tag numbers do not line up with the commit graph
+(for example: backports, branch-specific releases, calendar versions, or
+nonlinear maintenance branches). The nearest ancestor tag is usually the safest
+baseline because it reflects where this fork actually sits in history.
+EOF
+
+    if [[ -t 0 ]]; then
+        cat <<EOF
+Choose the baseline to record:
+  1) $NEAREST_ANCESTOR_TAG  (nearest ancestor; recommended default)
+  2) $HIGHEST_ANCESTOR_TAG  (highest version-like ancestor)
+  3) another tag/manual value
+EOF
+        read -r -p "Baseline choice [1/2/3 or tag name, default: 1]: " choice
+        case "$choice" in
+            ""|1)
+                LAST_TAG="$NEAREST_ANCESTOR_TAG"
+                BOOTSTRAP_BASELINE_SOURCE="interactive choice: nearest ancestor"
+                ;;
+            2)
+                LAST_TAG="$HIGHEST_ANCESTOR_TAG"
+                BOOTSTRAP_BASELINE_SOURCE="interactive choice: highest version-like ancestor"
+                ;;
+            3)
+                read -r -p "Enter baseline tag: " LAST_TAG
+                BOOTSTRAP_BASELINE_SOURCE="interactive manual choice"
+                ;;
+            *)
+                LAST_TAG="$choice"
+                BOOTSTRAP_BASELINE_SOURCE="interactive manual choice"
+                ;;
+        esac
+    else
+        echo "Non-interactive run: defaulting to nearest ancestor tag $NEAREST_ANCESTOR_TAG."
+        echo "To choose a different baseline, rerun with UPSTREAM_SYNC_BASELINE_TAG=<tag>."
+        LAST_TAG="$NEAREST_ANCESTOR_TAG"
+        BOOTSTRAP_BASELINE_SOURCE="non-interactive default: nearest ancestor"
+    fi
+fi
+
+if [[ -n "$LAST_TAG" ]] && \
+   ! git rev-parse -q --verify "refs/tags/$LAST_TAG" >/dev/null; then
+    echo "Error: selected bootstrap baseline tag does not exist locally: $LAST_TAG" >&2
+    echo "Fetch tags or choose a valid tag, then rerun." >&2
+    exit 2
+fi
+
+if [[ -z "$LAST_TAG" ]]; then
+    LAST_TAG="$LATEST_TAG"
+    BOOTSTRAP_BASELINE_SOURCE="no shared ancestor fallback: latest tag"
+    BOOTSTRAP_BASELINE_WARNING="no upstream tag was found in fork ancestry; defaulted to latest tag ($LATEST_TAG)"
+fi
 ```
 
-Two outcomes:
+If `NEAREST_ANCESTOR_TAG` and `HIGHEST_ANCESTOR_TAG` differ, warn prominently. In an interactive run, pause and let the user choose before continuing. In a non-interactive CI run, default to the nearest ancestor tag, store `BOOTSTRAP_BASELINE_WARNING`, and explain in the MR description that the reviewer should verify the baseline or rerun with `UPSTREAM_SYNC_BASELINE_TAG=<tag>` if the highest-numbered/manual tag is correct.
+
+Three outcomes:
 
 - **A baseline tag was found** (the common case). Continue to step 4's comparison with that `LAST_TAG`. If it equals `LATEST_TAG`, the workflow proceeds as the normal "no-op except this is the first time we're recording it": create a sync branch, write `.upstream-version`, commit, push, open a tiny MR titled `chore: bootstrap upstream tracking at <tag>`. If `LATEST_TAG` is newer, the workflow does a normal merge from the discovered baseline forward — the resulting MR contains both the merge commit *and* the new `.upstream-version` file, naturally. Either way, only one MR is produced.
+- **Nearest and highest ancestor tags differ**. Treat this as a baseline-selection risk, not a fatal error. Prefer the nearest ancestor unless the user chooses otherwise, because the nearest tag reflects the commit graph. Record the warning in the MR description so reviewers understand why the chosen baseline may not be the largest visible version number.
 - **No baseline tag was found** (no upstream tag is in the fork's ancestry — the fork was re-initialized, or has been heavily rewritten and lost upstream's history). Don't guess. Set `LAST_TAG="$LATEST_TAG"` so the comparison in step 4 reports "already up to date" and the bootstrap MR is just the `.upstream-version` file pinned to the current latest. **Prominently** flag in the MR description that no shared history was detected and ask the human to verify this baseline is sensible — future syncs will only kick in once a *newer* tag ships, so a wrong baseline here means future merges silently miss everything between the real baseline and `LATEST_TAG`.
 
-When `BOOTSTRAPPED=1`, the MR description (step 9) should open with a short paragraph stating that this is a first-run bootstrap and which baseline tag was discovered (or that none was found, in the no-shared-history case). This is the only thing reviewers need to know to trust the rest of the MR.
+When `BOOTSTRAPPED=1`, the MR description (step 9) should open with a short paragraph stating that this is a first-run bootstrap, which baseline tag was discovered or chosen, and any `BOOTSTRAP_BASELINE_WARNING` (nearest/highest mismatch or no shared tag). This is the only thing reviewers need to know to trust the rest of the MR.
 
 Why discover-then-fall-through instead of just bootstrapping to "latest"? A naive bootstrap to the latest tag would silently lie about the fork's actual baseline. The next sync would then look at `LAST_TAG..NEW_TAG` and miss the entire range from the *real* baseline to the wrongly-recorded one — meaning the first real sync would be huge and the conflict-resolution log would mix many releases together. Discovering the true baseline keeps every future sync small and traceable.
 
@@ -332,6 +410,11 @@ If `glab mr note` is unavailable, use the GitLab notes API (`POST /projects/:id/
 
 Automated sync of upstream tag `<LATEST_TAG>` into `<DEV_BRANCH>`.
 
+<If `BOOTSTRAPPED=1`, add this paragraph near the top:>
+
+### Bootstrap notes
+This is a first-run bootstrap. The recorded baseline is `<LAST_TAG>` (`<BOOTSTRAP_BASELINE_SOURCE>`). <If `BOOTSTRAP_BASELINE_WARNING` is set, explain the warning and whether the baseline was chosen interactively, overridden via `UPSTREAM_SYNC_BASELINE_TAG`, or defaulted in non-interactive mode.>
+
 ### Upstream changelog
 Release notes are posted as a separate MR comment after creation. Summary/link: <compare URL or tag/release URL if derivable from the upstream URL>
 
@@ -392,6 +475,7 @@ If `UPSTREAM_SYNC_DRY_RUN=1` is set in the environment, do everything through st
 
 - **Merge fails for a reason other than conflicts** (e.g., upstream history diverged): don't force it. Abort, leave no MR, exit non-zero so the CI job is visibly red. Leave a message explaining what was tried.
 - **Conflict that's genuinely unsafe to resolve automatically** (e.g., diverging crypto code, security-sensitive logic): stop, keep the conflict markers in the file, `git add` it anyway, commit with a message flagging this, and say so prominently in the MR description. Humans finish the job. Better to open an MR with flagged conflicts than to silently make a wrong decision.
+- **First-run bootstrap finds different nearest and highest numbered ancestor tags**: warn prominently. In interactive mode, let the user choose the baseline. In non-interactive CI, default to the nearest ancestor tag and document the mismatch in the MR so reviewers can rerun with `UPSTREAM_SYNC_BASELINE_TAG=<tag>` if needed.
 - **Push rejected**: likely a branch-protection rule on the sync branch namespace. Report and exit non-zero.
 - **MR already exists** for this tag: update the existing MR's description rather than opening a duplicate.
 
